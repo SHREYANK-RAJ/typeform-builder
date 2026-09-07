@@ -98,7 +98,7 @@ export default function ResultsPage({
    * Format date
    */
   function formatDate(date: string) {
-    return new Date(date).toLocaleString(
+    return new Date(date.endsWith("Z") ? date : `${date}Z`).toLocaleString(
       "en-IN",
       {
         dateStyle: "medium",
