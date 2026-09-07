@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.form import Form
 from app.models.question import Question
+from app.models.logic_rule import LogicRule
 from app.schemas import QuestionCreate, QuestionUpdate, QuestionResponse
 
 
@@ -34,10 +35,40 @@ def create_question(
     question_data: QuestionCreate,
     db: Session = Depends(get_db)
 ):
+    # Make sure the form exists
     form = db.query(Form).filter(Form.id == form_id).first()
 
     if not form:
-        raise HTTPException(status_code=404, detail="Form not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Form not found"
+        )
+
+    # Validate question type
+    allowed_types = {
+        "short_text",
+        "long_text",
+        "multiple_choice",
+        "dropdown",
+        "email",
+        "number",
+        "yes_no",
+        "rating",
+    }
+
+    if question_data.type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported question type: {question_data.type}"
+        )
+
+    # Choice-based questions should have options
+    if question_data.type in {"multiple_choice", "dropdown"}:
+        if not question_data.options or len(question_data.options) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Multiple choice and dropdown questions require options"
+            )
 
     existing_questions = (
         db.query(Question)
@@ -48,7 +79,7 @@ def create_question(
     question = Question(
         form_id=form_id,
         type=question_data.type,
-        title=question_data.title,
+        title=question_data.title.strip(),
         description=question_data.description,
         required=question_data.required,
         position=existing_questions,
@@ -74,10 +105,14 @@ def get_questions(
     form_id: int,
     db: Session = Depends(get_db)
 ):
+    # Make sure the form exists
     form = db.query(Form).filter(Form.id == form_id).first()
 
     if not form:
-        raise HTTPException(status_code=404, detail="Form not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Form not found"
+        )
 
     questions = (
         db.query(Question)
@@ -86,7 +121,10 @@ def get_questions(
         .all()
     )
 
-    return [question_to_response(question) for question in questions]
+    return [
+        question_to_response(question)
+        for question in questions
+    ]
 
 
 @router.put(
@@ -105,15 +143,46 @@ def update_question(
     )
 
     if not question:
-        raise HTTPException(status_code=404, detail="Question not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Question not found"
+        )
 
     updates = question_data.model_dump(exclude_unset=True)
 
+    # Validate type if it is being changed
+    if "type" in updates:
+        allowed_types = {
+            "short_text",
+            "long_text",
+            "multiple_choice",
+            "dropdown",
+            "email",
+            "number",
+            "yes_no",
+            "rating",
+        }
+
+        if updates["type"] not in allowed_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported question type: {updates['type']}"
+            )
+
+    # Apply normal updates
     if "type" in updates:
         question.type = updates["type"]
 
     if "title" in updates:
-        question.title = updates["title"]
+        title = updates["title"]
+
+        if not title or not title.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Question title cannot be empty"
+            )
+
+        question.title = title.strip()
 
     if "description" in updates:
         question.description = updates["description"]
@@ -122,6 +191,15 @@ def update_question(
         question.required = updates["required"]
 
     if "options" in updates:
+        new_type = updates.get("type", question.type)
+
+        if new_type in {"multiple_choice", "dropdown"}:
+            if not updates["options"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Multiple choice and dropdown questions require options"
+                )
+
         question.options = (
             json.dumps(updates["options"])
             if updates["options"] is not None
@@ -146,12 +224,24 @@ def delete_question(
     )
 
     if not question:
-        raise HTTPException(status_code=404, detail="Question not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Question not found"
+        )
+
+    # Delete any Logic Jump rules that reference this question.
+    # This prevents orphaned rules after deleting a question.
+    db.query(LogicRule).filter(
+        (LogicRule.source_question_id == question_id)
+        | (LogicRule.target_question_id == question_id)
+    ).delete(synchronize_session=False)
 
     db.delete(question)
     db.commit()
 
-    return {"message": "Question deleted successfully"}
+    return {
+        "message": "Question deleted successfully"
+    }
 
 
 @router.put("/api/forms/{form_id}/questions/reorder")
@@ -160,10 +250,14 @@ def reorder_questions(
     question_ids: list[int],
     db: Session = Depends(get_db)
 ):
+    # Make sure the form exists
     form = db.query(Form).filter(Form.id == form_id).first()
 
     if not form:
-        raise HTTPException(status_code=404, detail="Form not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Form not found"
+        )
 
     questions = (
         db.query(Question)
@@ -176,13 +270,65 @@ def reorder_questions(
         for question in questions
     }
 
-    if set(question_ids) != set(question_map.keys()):
+    # Ensure the submitted list contains exactly
+    # the questions belonging to this form.
+    if (
+        len(question_ids) != len(question_map)
+        or set(question_ids) != set(question_map.keys())
+    ):
         raise HTTPException(
             status_code=400,
             detail="Question IDs do not match this form's questions"
         )
 
-    for position, question_id in enumerate(question_ids):
+    # Prevent duplicate IDs in the reorder request.
+    if len(question_ids) != len(set(question_ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="Duplicate question IDs are not allowed"
+        )
+
+    # Calculate the new position of every question.
+    new_positions = {
+        question_id: position
+        for position, question_id in enumerate(question_ids)
+    }
+
+    # Existing Logic Jump rules are only valid when the
+    # target question comes after the source question.
+    logic_rules = (
+        db.query(LogicRule)
+        .filter(LogicRule.form_id == form_id)
+        .all()
+    )
+
+    for rule in logic_rules:
+        source_position = new_positions.get(
+            rule.source_question_id
+        )
+
+        target_position = new_positions.get(
+            rule.target_question_id
+        )
+
+        if source_position is None or target_position is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Logic Jump references an invalid question"
+            )
+
+        if target_position <= source_position:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cannot reorder questions because a Logic Jump "
+                    f"from question {rule.source_question_id} to "
+                    f"question {rule.target_question_id} would become invalid"
+                )
+            )
+
+    # Apply the new positions.
+    for question_id, position in new_positions.items():
         question_map[question_id].position = position
 
     db.commit()
