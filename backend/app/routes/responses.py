@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+import re
 
 from app.database import get_db
 from app.models.form import Form
@@ -8,6 +9,9 @@ from app.models.response import FormResponse, Answer
 from app.schemas import ResponseCreate, ResponseResponse
 
 router = APIRouter(tags=["Responses"])
+
+
+EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 
 @router.post(
@@ -19,7 +23,6 @@ def submit_response(
     response_data: ResponseCreate,
     db: Session = Depends(get_db)
 ):
-    # Check that the form exists
     form = db.query(Form).filter(Form.id == form_id).first()
 
     if not form:
@@ -28,7 +31,12 @@ def submit_response(
             detail="Form not found"
         )
 
-    # Get all questions belonging to this form
+    if not form.is_published:
+        raise HTTPException(
+            status_code=403,
+            detail="This form is not published"
+        )
+
     questions = (
         db.query(Question)
         .filter(Question.form_id == form_id)
@@ -40,7 +48,9 @@ def submit_response(
         for question in questions
     }
 
-    # Validate answers
+    # Prevent duplicate answers for the same question
+    submitted_question_ids = set()
+
     for answer_data in response_data.answers:
 
         if answer_data.question_id not in question_map:
@@ -49,23 +59,91 @@ def submit_response(
                 detail=f"Question {answer_data.question_id} does not belong to this form"
             )
 
-    # Check required questions
-    for question in questions:
-
-        if question.required:
-            answered = any(
-                answer.question_id == question.id
-                and answer.value.strip() != ""
-                for answer in response_data.answers
+        if answer_data.question_id in submitted_question_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Question {answer_data.question_id} has multiple answers"
             )
 
-            if not answered:
+        submitted_question_ids.add(answer_data.question_id)
+
+        question = question_map[answer_data.question_id]
+        value = answer_data.value.strip()
+
+        # Required validation
+        if question.required and not value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Required question '{question.title}' was not answered"
+            )
+
+        # Skip type validation for optional empty answers
+        if not value:
+            continue
+
+        # Email validation
+        if question.type == "email":
+            if not re.match(EMAIL_REGEX, value):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Required question '{question.title}' was not answered"
+                    detail=f"Invalid email for question '{question.title}'"
                 )
 
-    # Create response
+        # Number validation
+        if question.type == "number":
+            try:
+                float(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid number for question '{question.title}'"
+                )
+
+        # Yes/No validation
+        if question.type == "yes_no":
+            if value not in ["Yes", "No"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid answer for question '{question.title}'"
+                )
+
+        # Rating validation
+        if question.type == "rating":
+            try:
+                rating = int(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid rating for question '{question.title}'"
+                )
+
+            if rating < 1 or rating > 5:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Rating must be between 1 and 5 for question '{question.title}'"
+                )
+
+        # Choice/dropdown validation
+        if question.type in ["multiple_choice", "dropdown"]:
+            if question.options:
+                import json
+
+                options = json.loads(question.options)
+
+                if value not in options:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid option for question '{question.title}'"
+                    )
+
+    # Check required questions that were completely omitted
+    for question in questions:
+        if question.required and question.id not in submitted_question_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Required question '{question.title}' was not answered"
+            )
+
     new_response = FormResponse(
         form_id=form_id
     )
@@ -73,13 +151,12 @@ def submit_response(
     db.add(new_response)
     db.flush()
 
-    # Create answers
     for answer_data in response_data.answers:
 
         answer = Answer(
             response_id=new_response.id,
             question_id=answer_data.question_id,
-            value=answer_data.value
+            value=answer_data.value.strip()
         )
 
         db.add(answer)
