@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --accent-primary: #111111;
+  --accent-primary-hover: #333333;
+  --accent-soft: #f3f3f3;
+  --accent-border: #d4d4d4;
+}
+
+:root[data-accent="ocean"] {
+  --accent-primary: #2563eb;
+  --accent-primary-hover: #1d4ed8;
+  --accent-soft: #dbeafe;
+  --accent-border: #93c5fd;
+}
+
+:root[data-accent="lavender"] {
+  --accent-primary: #7c3aed;
+  --accent-primary-hover: #6d28d9;
+  --accent-soft: #ede9fe;
+  --accent-border: #c4b5fd;
+}
+
+:root[data-accent="sunset"] {
+  --accent-primary: #ea580c;
+  --accent-primary-hover: #c2410c;
+  --accent-soft: #ffedd5;
+  --accent-border: #fdba74;
+}
+
+html {
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
